@@ -1,0 +1,1 @@
+"""Calcular y registrar cobro."""

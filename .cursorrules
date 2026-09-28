@@ -1,0 +1,187 @@
+# Parqueadero System — Cursor Rules
+
+Sistema de parqueaderos **offline-first**: operación local con SQLite y sincronización hacia PostgreSQL cuando hay red. Stack: Python 3.12+, FastAPI, SQLAlchemy 2.x (async), Pydantic v2.
+
+Estas reglas aplican a todo el repositorio.
+
+---
+
+## 1. Arquitectura limpia
+
+Capas (dependencias solo hacia adentro):
+
+```
+interfaces  →  application  →  domain
+     ↓              ↓
+infrastructure (adapters: DB, sync, clock, IDs)
+```
+
+| Capa | Responsabilidad | Puede importar |
+|---|---|---|
+| `domain/` | Entidades, value objects, reglas de negocio, puertos (interfaces) | Nada de frameworks ni I/O |
+| `application/` | Casos de uso, orquestación, DTOs de aplicación | `domain` |
+| `infrastructure/` | SQLite, PostgreSQL, repositorios, sync engine, HTTP clients | `domain`, `application` (implementar puertos) |
+| `interfaces/` | FastAPI routers, schemas HTTP, CLI, workers | `application` (no domain internals ni SQL) |
+
+Reglas:
+
+- El dominio **nunca** importa FastAPI, SQLAlchemy, `aiosqlite`, `asyncpg`, ni Pydantic de API.
+- Los casos de uso dependen de **puertos** (`Protocol` / ABC), no de implementaciones concretas.
+- Inyección de dependencias en `interfaces` / composition root (`main.py` o `container.py`).
+- Un caso de uso = una operación de negocio (ingreso, salida, cobro, cierre de turno, sync).
+- No poner SQL ni `session.execute` en routers ni en entidades.
+
+Estructura esperada:
+
+```
+src/parqueadero/
+  domain/
+    entities/
+    value_objects/
+    ports/
+    services/          # domain services puros
+    exceptions.py
+  application/
+    use_cases/
+    dtos/
+  infrastructure/
+    persistence/
+      sqlite/
+      postgres/
+    sync/
+    clock.py
+    ids.py
+  interfaces/
+    api/
+      routers/
+      schemas/
+    cli/
+```
+
+---
+
+## 2. Tipado estricto
+
+- `from __future__ import annotations` en módulos con forward refs.
+- Anotar **todos** los parámetros, retornos y atributos públicos.
+- Usar `Protocol` para puertos; no `Any` salvo frontera serialización (y acotar con `cast` + comentario).
+- Preferir `TypedDict`, `NewType`, enums y value objects (`Placa`, `Money`, `TicketId`) frente a `str`/`float` crudos.
+- Pydantic v2 (`BaseModel`, `ConfigDict`) solo en `interfaces` y DTOs de aplicación, no en entidades de dominio.
+- SQLAlchemy 2.x mapped types (`Mapped[T]`, `mapped_column`).
+- `mypy --strict` (o `pyright` strict) debe pasar. No silenciar errores con `# type: ignore` sin justificación y ticket.
+- Evitar `dict[str, Any]` en APIs internas; definir modelos.
+
+```python
+# ❌ MAL
+async def registrar(placa, tarifa):
+    return {"ok": True}
+
+# ✅ BIEN
+async def registrar_ingreso(placa: Placa, tarifa: TarifaId) -> Ticket:
+    ...
+```
+
+---
+
+## 3. Async / await
+
+- I/O (DB, red, filesystem de sync) **siempre** async: `async def`, `await`.
+- Usar `AsyncSession` / drivers async (`aiosqlite`, `asyncpg`). No mezclar `Session` síncrona en el request path.
+- No bloquear el event loop: CPU pesado o librerías sync → `asyncio.to_thread` (o process pool si es largo).
+- No usar `time.sleep`; usar `asyncio.sleep`.
+- Transacciones: `async with session.begin()`. Un caso de uso = una unidad de trabajo.
+- Routers FastAPI: handlers `async def`. Dependencias de DB async.
+- Evitar `asyncio.get_event_loop().run_until_complete` dentro de código ya async.
+- Timeouts explícitos en llamadas de red y sync (`asyncio.timeout` / httpx timeouts).
+
+```python
+# ❌ MAL
+def obtener_ticket(id: TicketId) -> Ticket:
+    return session.get(TicketModel, id)
+
+# ✅ BIEN
+async def obtener_ticket(id: TicketId) -> Ticket:
+    return await repo.get(id)
+```
+
+---
+
+## 4. Persistencia dual (SQLite local + PostgreSQL)
+
+- **Fuente de verdad operativa local:** SQLite. La UI/API de taquilla escribe primero en SQLite.
+- **Fuente de verdad corporativa / reportes:** PostgreSQL, alimentada por sincronización.
+- Repositorios implementan el mismo puerto; factory según contexto (`local` vs `cloud`).
+- Modelos de infraestructura pueden diferir; el mapeo a entidades de dominio es obligatorio.
+- IDs: UUIDv7 (o ULID) generados **en el cliente/nodo**, nunca seriales autoincrement que choquen entre sedes.
+- Cada agregado versionable lleva: `id`, `updated_at` (UTC), `version` (monotonic int), `origin_node_id`, `deleted_at` (soft delete).
+- Timestamps siempre **UTC** (`datetime` timezone-aware).
+- No compartir conexiones SQLite entre threads; un async engine por proceso.
+
+---
+
+## 5. Sincronización offline-first
+
+Principios:
+
+1. La taquilla **nunca** espera a PostgreSQL para ingresar/salir un vehículo.
+2. Toda mutación local genera un **evento de outbox** en la misma transacción SQLite.
+3. El sync worker envía outbox a PostgreSQL (o API de sync) de forma at-least-once.
+4. Idempotencia: clave `(origin_node_id, event_id)` o `(aggregate_id, version)` única en el servidor.
+5. Reintentos con backoff + jitter. Eventos fallidos van a `dead_letter` con causa; no se descartan en silencio.
+6. Pull: el nodo descarga cambios ajenos por `updated_at` / cursor; aplicar en orden de versión.
+
+Conflictos:
+
+- Política por defecto: **last-write-wins por `updated_at` + `version`**, con merge explícito solo en agregados definidos (p. ej. catálogo de tarifas).
+- Si `incoming.version <= local.version` y el origen es otro nodo → no sobrescribir a ciegas; registrar conflicto.
+- Tickets abiertos/cerrados: transiciones de estado son **monótonas** (abierto → cerrado). Un cierre no se “reabre” por un pull viejo.
+- Reloj: usar tiempo de servidor local del nodo; no confiar en reloj del cloud para autorizar operación de patio.
+
+Outbox (campos mínimos): `event_id`, `aggregate_type`, `aggregate_id`, `event_type`, `payload`, `occurred_at`, `origin_node_id`, `status` (`pending|sent|acked|failed`).
+
+Nunca:
+
+- Escribir a PostgreSQL desde un caso de uso de patio sin pasar por outbox.
+- Borrar el outbox antes de ack confirmado.
+- Sync en el hilo del request HTTP de cobro (encolar y seguir).
+
+---
+
+## 6. FastAPI e interfaces
+
+- Routers delgados: validar HTTP → llamar use case → mapear respuesta.
+- Schemas Pydantic en `interfaces/api/schemas`; no reutilizar modelos ORM.
+- Errores de dominio → HTTP mapping centralizado (404, 409, 422). No `HTTPException` dentro del dominio.
+- Versionar API (`/api/v1/...`).
+- Auth en interfaces; el dominio recibe `UsuarioId` / `Rol`, no tokens.
+
+---
+
+## 7. Dominio de parqueadero (invariantes)
+
+- Un vehículo **activo** (ticket abierto) por placa+sede a la vez.
+- Cobro calculado en dominio (tarifas, fracciones, tope diario, convenios); no en SQL suelto ni en el frontend.
+- Dinero: enteros en **centavos** (`Money`) o `Decimal`; nunca `float`.
+- Placas: value object normalizado (mayúsculas, sin espacios).
+- Turnos de caja: apertura/cierre con arqueo; movimientos de caja son eventos.
+- Operaciones de patio deben ser deterministas y testeables sin red.
+
+---
+
+## 8. Testing y calidad
+
+- Tests de dominio **puros** (sin DB).
+- Tests de aplicación con fakes de puertos.
+- Tests de infra: SQLite en memoria / archivo temp; PostgreSQL solo en integración.
+- Tests de sync: outbox, idempotencia, conflicto de versiones, replay.
+- `ruff` + type checker en CI. Sin `print` de debug en main.
+
+---
+
+## 9. Estilo de código
+
+- Nombres en español para conceptos de negocio (`Ticket`, `Tarifa`, `TurnoCaja`); inglés para infra genérica (`OutboxPublisher`).
+- Funciones pequeñas; sin efectos colaterales ocultos en properties.
+- Logging estructurado (`node_id`, `ticket_id`, `event_id`); no loguear secretos ni placas completas en INFO si hay política de privacidad (enmascarar).
+
+Al generar código: respeta capas, tipos, async y outbox. Si un cambio viola offline-first, detente y rediseña.
